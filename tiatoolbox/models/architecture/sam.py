@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from collections import OrderedDict
 
-import cv2
 import numpy as np
+from tiatoolbox.models.models_abc import ModelABC
 import torch
 import torch.nn.functional as F  # noqa: N812
 from skimage import morphology
@@ -15,36 +15,45 @@ from tiatoolbox.utils import misc
 
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
-
-checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
-model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
-
-sam_model = build_sam2(model_cfg, checkpoint)
-
-predictor = SAM2ImagePredictor(sam_model)
-
-with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-    predictor.set_image(<your_image>)
-    masks, _, _ = predictor.predict(<input_prompts>)
+from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 
 class SAM(ModelABC):
 
-    def __init__(self: ModelABC) -> None:
-        """Initialize Abstract class ModelABC."""
+    def __init__(
+        self: SAM,
+        num_input_channels: int,
+        num_output_channels: int,
+        checkpoint_path: str = "./checkpoints/sam2.1_hiera_large.pt",
+        model_cfg_path: str = "configs/sam2.1/sam2.1_hiera_l.yaml",
+    ) -> None:
+        """Initialize :class:`SAM`."""
         super().__init__()
-        self._postproc = self.postproc
-        self._preproc = self.preproc
+        self.net_name = "SAM"
 
-    def forward(self: ModelABC, *args: tuple[Any, ...], **kwargs: dict) -> None:
+        self.n_channels = num_input_channels
+        self.n_classes = num_output_channels
+
+        self.sam_model = build_sam2(model_cfg_path, checkpoint_path)
+    
+        self.predictor = SAM2ImagePredictor(self.sam_model)
+        self.generator = SAM2AutomaticMaskGenerator(self.sam_model)
+
+
+    def forward(self: SAM, image: torch.Tensor) -> torch.Tensor:
         """Torch method, this contains logic for using layers defined in init."""
-        ...  # pragma: no cover
 
+        processed_image = self.preproc(image)
+        features = self.encode_image(processed_image)
+        mask = self.generate_mask(features)
+        return self.postproc(mask)
+    
+    @staticmethod
     def infer_batch(
         model: torch.nn.Module,
         batch_data: np.ndarray,
         *,
         on_gpu: bool,
-    ) -> None:
+    ) -> np.ndarray:
         """Run inference on an input batch.
 
         Contains logic for forward operation as well as I/O aggregation.
@@ -59,10 +68,43 @@ class SAM(ModelABC):
                 Whether to run inference on a GPU.
 
         """
-        ...  # pragma: no cover
+        model.eval()
+        device = misc.select_device(on_gpu=on_gpu)
+
+        # Assume batch_data is NCHW
+        batch_data = batch_data.to(device).type(torch.float32)
+
+        with torch.inference_mode():
+            output = model(batch_data)
+            output = torch.sigmoid(output)
+            output = torch.squeeze(output, 1)
+
+        return output.cpu().numpy()
+    
+    @staticmethod
+    def encode_image(self: ModelABC, image: torch.Tensor) -> torch.Tensor:
+        """Encodes the image for feature extraction."""
+        self.model.set_image(image)
+        features = self.model.features
+        return features
+    
+    @staticmethod
+    def generate_mask(self: ModelABC, features: torch.Tensor, prompt=None) -> np.ndarray:
+        """Generates a segmentation mask using SAM 2, optionally guided by a prompt."""
+        if prompt:
+            masks = self.predictor.predict(features, prompt)
+        else:
+            masks = self.generator.generate(features)
+        return masks
+    
+    @staticmethod
+    def load_weights(self, checkpoint_path: str) -> None:
+        """Loads model weights from specified checkpoint."""
+        self.model.load_state_dict(torch.load(checkpoint_path, map_location=self.device))
+
 
     @staticmethod
-    def preproc(image: np.ndarray) -> np.ndarray:
+    def preproc(image: torch.Tensor) -> torch.Tensor:
         """Define the pre-processing of this class of model."""
         return image
 
