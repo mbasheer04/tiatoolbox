@@ -9,8 +9,10 @@ from .architecture.mapde import MapDe
 from .architecture.micronet import MicroNet
 from .architecture.nuclick import NuClick
 from .architecture.sccnn import SCCNN
+from .architecture.sam import SAM
 from .engine.multi_task_segmentor import MultiTaskSegmentor
 from .engine.nucleus_instance_segmentor import NucleusInstanceSegmentor
+from .engine.sam_engine import GeneralSegmentor
 from .engine.patch_predictor import (
     IOPatchPredictorConfig,
     PatchDataset,

@@ -17,42 +17,46 @@ from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 
-class SAM(ModelABC):
+class SAMPrompts():
+    """Structure of prompts for SAM."""
+    def __init__(self, point_coords = None, point_labels = None, box_coords = None):
+        self.point_coords = point_coords
+        self.point_labels = point_labels
+        if(point_coords and point_labels is None):
+            self.point_labels = np.arange(1,len(point_coords)+1) # Default labels
+        self.box_coords = box_coords
 
+class SAM(ModelABC):
     def __init__(
         self: SAM,
-        num_input_channels: int,
-        num_output_channels: int,
-        checkpoint_path: str = "./checkpoints/sam2.1_hiera_large.pt",
-        model_cfg_path: str = "configs/sam2.1/sam2.1_hiera_l.yaml",
+        model_hf_path: str = "facebook/sam2-hiera-tiny",
+        checkpoint_path: str = None,
+        model_cfg_path: str = None,
     ) -> None:
         """Initialize :class:`SAM`."""
         super().__init__()
         self.net_name = "SAM"
 
-        self.n_channels = num_input_channels
-        self.n_classes = num_output_channels
-
-        self.sam_model = build_sam2(model_cfg_path, checkpoint_path)
+        if checkpoint_path is None or model_cfg_path is None:
+            self.model = build_sam2_hf(model_hf_path, device="cpu")
+        else:
+            self.model = build_sam2(model_cfg_path, checkpoint_path)
     
-        self.predictor = SAM2ImagePredictor(self.sam_model)
-        self.generator = SAM2AutomaticMaskGenerator(self.sam_model)
+        self.predictor = SAM2ImagePredictor(self.model)
+        self.generator = SAM2AutomaticMaskGenerator(self.model)
 
-
-    def forward(self: SAM, image: torch.Tensor) -> torch.Tensor:
+    def forward(self: SAM, image: np.ndarray, prompts: SAMPrompts = None) -> np.ndarray:
         """Torch method, this contains logic for using layers defined in init."""
-
-        processed_image = self.preproc(image)
-        features = self.encode_image(processed_image)
-        mask = self.generate_mask(features)
-        return self.postproc(mask)
+        mask = self.generate_mask(self, image, prompts)
+        return mask
     
     @staticmethod
     def infer_batch(
         model: torch.nn.Module,
-        batch_data: np.ndarray,
+        batch_data: list,
+        prompts: SAMPrompts,
         *,
-        on_gpu: bool,
+        device,
     ) -> np.ndarray:
         """Run inference on an input batch.
 
@@ -69,30 +73,36 @@ class SAM(ModelABC):
 
         """
         model.eval()
-        device = misc.select_device(on_gpu=on_gpu)
+        model = model.to(device)
 
-        # Assume batch_data is NCHW
-        batch_data = batch_data.to(device).type(torch.float32)
+        if isinstance(batch_data, torch.Tensor): # Move the tensor to the CPU if it's a PyTorch tensor
+            batch_data = batch_data.to(device).type(torch.float32)
+            batch_data = batch_data.cpu().numpy()
 
         with torch.inference_mode():
-            output = model(batch_data)
-            output = torch.sigmoid(output)
-            output = torch.squeeze(output, 1)
+            batch_data = model.preproc(batch_data)
+            output = model(batch_data, prompts)
+            output = model.postproc(output)
+        return output
 
-        return output.cpu().numpy()
-    
     @staticmethod
-    def encode_image(self: ModelABC, image: torch.Tensor) -> torch.Tensor:
+    def encode_image(self, image: np.ndarray) -> np.ndarray:
         """Encodes the image for feature extraction."""
-        self.model.set_image(image)
-        features = self.model.features
-        return features
+        self.predictor.set_image(image)
     
     @staticmethod
-    def generate_mask(self: ModelABC, features: torch.Tensor, prompt=None) -> np.ndarray:
+    def generate_mask(self, features: np.ndarray, prompts: SAMPrompts) -> np.ndarray:
         """Generates a segmentation mask using SAM 2, optionally guided by a prompt."""
-        if prompt:
-            masks = self.predictor.predict(features, prompt)
+        if prompts:
+            self.encode_image(self, features)
+            masks, scores, _ = self.predictor.predict(
+                point_coords=prompts.point_coords,
+                point_labels=prompts.point_labels,
+                box=prompts.box_coords,
+                multimask_output=False,
+            )
+            sorted_ind = np.argsort(scores)[::-1]
+            masks = masks[sorted_ind]
         else:
             masks = self.generator.generate(features)
         return masks
@@ -102,14 +112,23 @@ class SAM(ModelABC):
         """Loads model weights from specified checkpoint."""
         self.model.load_state_dict(torch.load(checkpoint_path, map_location=self.device))
 
-
     @staticmethod
-    def preproc(image: torch.Tensor) -> torch.Tensor:
-        """Define the pre-processing of this class of model."""
+    def preproc(image: np.ndarray) -> np.ndarray:
+        """Pre-processes images - Converts them into a format accepted by SAM (HWC) from NCHW."""
+        if isinstance(image, torch.Tensor): # Move the tensor to the CPU if it's a PyTorch tensor
+            image = image.cpu().numpy()
+        
+        # Handle different shapes
+        if image.ndim == 4 and image.shape == (1,512,512,3):  # Case 1: (N, H, W, C)
+            image = np.squeeze(image, axis=0)  # Remove batch dimension
+        elif image.ndim == 4 and image.shape == (1,3,512,512):  # Case 2: (N, C, H, W)
+            image = np.squeeze(image, axis=0)  # Remove batch dimension
+            image = np.transpose(image, (1, 2, 0))  # (C, H, W) -> (H, W, C)
+
+        image = image[:, :, :3]  # Remove alpha channel
         return image
 
     @staticmethod
     def postproc(image: np.ndarray) -> np.ndarray:
         """Define the post-processing of this class of model."""
         return image
-    
