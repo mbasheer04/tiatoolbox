@@ -9,7 +9,7 @@ import urllib
 from cmath import pi
 from pathlib import Path, PureWindowsPath
 from shutil import rmtree
-from typing import TYPE_CHECKING, Any, Callable, SupportsFloat
+from typing import TYPE_CHECKING, Any, SupportsFloat
 
 import numpy as np
 import requests
@@ -65,9 +65,8 @@ from requests.adapters import HTTPAdapter, Retry
 # GitHub actions seems unable to find TIAToolbox unless this is here
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from tiatoolbox import logger
-from tiatoolbox.models.engine.nucleus_instance_segmentor import (
-    NucleusInstanceSegmentor,
-)
+from tiatoolbox.models.engine.nucleus_instance_segmentor import NucleusInstanceSegmentor
+from tiatoolbox.models.engine.prompt_segmentor import PromptSegmentor
 from tiatoolbox.tools.pyramid import ZoomifyGenerator
 from tiatoolbox.utils.misc import select_device
 from tiatoolbox.utils.visualization import random_colors
@@ -75,6 +74,8 @@ from tiatoolbox.visualization.ui_utils import get_level_by_extent
 from tiatoolbox.wsicore.wsireader import WSIReader
 
 if TYPE_CHECKING:  # pragma: no cover
+    from collections.abc import Callable
+
     from bokeh.document import Document
 
 rng = np.random.default_rng()
@@ -510,7 +511,6 @@ def add_layer(lname: str) -> None:
             end=1,
             value=0.75,
             step=0.01,
-            title=lname,
             height=40,
             width=100,
             max_width=90,
@@ -714,6 +714,12 @@ def populate_layer_list(slide_name: str, overlay_path: Path) -> None:
         "*.jpg",
         "*.json",
         "*.tiff",
+        "*.mrxs",
+        "*.ndpi",
+        "*.svs",
+        "*.tif",
+        "*.npy",
+        "*.mha",
     ]:
         file_list.extend(list(overlay_path.glob(str(Path("*") / ext))))
         file_list.extend(list(overlay_path.glob(ext)))
@@ -725,7 +731,16 @@ def populate_slide_list(slide_folder: Path, search_txt: str | None = None) -> No
     """Populate the slide list with the available slides."""
     file_list = []
     len_slidepath = len(slide_folder.parts)
-    for ext in ["*.svs", "*ndpi", "*.tiff", "*.mrxs", "*.jpg", "*.png", "*.tif"]:
+    for ext in [
+        "*.svs",
+        "*ndpi",
+        "*.tiff",
+        "*.mrxs",
+        "*.jpg",
+        "*.png",
+        "*.tif",
+        "*.dcm",
+    ]:
         file_list.extend(list(Path(slide_folder).glob(str(Path("*") / ext))))
         file_list.extend(list(Path(slide_folder).glob(ext)))
     if search_txt is None:
@@ -1003,7 +1018,8 @@ def layer_drop_cb(attr: MenuItemClick) -> None:
     if Path(attr.item).suffix in [".db", ".dat", ".geojson"]:
         update_ui_on_new_annotations(resp)
     else:
-        add_layer(resp)
+        if resp != "slide":
+            add_layer(resp)
         change_tiles(resp)
 
 
@@ -1053,7 +1069,9 @@ def layer_slider_cb(
             UI["vstate"].layer_dict[obj.name.split("_")[0]]
         ].glyph.line_alpha = new
     else:
-        UI["p"].renderers[UI["vstate"].layer_dict[obj.name.split("_")[0]]].alpha = new
+        UI["p"].renderers[
+            UI["vstate"].layer_dict["_".join(obj.name.split("_")[0:-1])]
+        ].alpha = new
 
 
 def color_input_cb(
@@ -1099,6 +1117,8 @@ def to_model_cb(attr: ButtonClick) -> None:  # noqa: ARG001
     """Callback to run currently selected model."""
     if UI["vstate"].current_model == "hovernet":
         segment_on_box()
+    elif UI["vstate"].current_model == "SAM":
+        sam_segment()
     # Add any other models here
     else:  # pragma: no cover
         logger.warning("unknown model")
@@ -1204,7 +1224,7 @@ def segment_on_box() -> None:
     # Make a mask defining the box
     thumb = UI["vstate"].wsi.slide_thumbnail()
     conv_mpp = UI["vstate"].dims[0] / thumb.shape[1]
-    msg = f'box tl: {UI["box_source"].data["x"][0]}, {UI["box_source"].data["y"][0]}'
+    msg = f"box tl: {UI['box_source'].data['x'][0]}, {UI['box_source'].data['y'][0]}"
     logger.info(msg)
     x = round(
         (UI["box_source"].data["x"][0] - 0.5 * UI["box_source"].data["width"][0])
@@ -1252,6 +1272,101 @@ def segment_on_box() -> None:
     # Clean up temp files
     rmtree(tmp_save_dir)
     rmtree(tmp_mask_dir)
+
+
+def sam_segment() -> None:
+    """Callback to run SAM using a point on the slide.
+
+    Will run GeneralSegmentor on selected region of wsi defined
+    by the point in pt_source.
+
+    """
+    # Get point coordinates
+    x = np.round(UI["pt_source"].data["x"])
+    y = np.round(UI["pt_source"].data["y"])
+    point_coords = (
+        np.array([[[x[i], -y[i]] for i in range(len(x))]], np.uint32)
+        if len(x) > 0
+        else None
+    )
+
+    # Get box coordinates
+    x = np.round(UI["box_source"].data["x"])
+    y = np.round(UI["box_source"].data["y"])
+    height = np.round(UI["box_source"].data["height"])
+    width = np.round(UI["box_source"].data["width"])
+    box_coords = (
+        np.array(
+            [[[x[i], -y[i], x[i] + width[i], height[i] - y[i]] for i in range(len(x))]],
+            np.uint32,
+        )
+        if len(x) > 0
+        else None
+    )
+
+    prompt_segmentor = PromptSegmentor()
+    tmp_save_dir = Path(tempfile.mkdtemp())
+    tmp_mask_dir = Path(tempfile.mkdtemp())
+
+    x_start = max(0, UI["p"].x_range.start)
+    y_start = max(0, -UI["p"].y_range.end)
+    x_end = min(UI["p"].x_range.end, UI["vstate"].dims[0])
+    y_end = min(-UI["p"].y_range.start, UI["vstate"].dims[1])
+
+    height = y_end - y_start
+    width = x_end - x_start
+    res = prompt_segmentor.calc_mpp((width, height), UI["vstate"].mpp[0], 1500)
+
+    # Make a mask defining the box
+    thumb = UI["vstate"].wsi.slide_thumbnail()
+    conv_mpp = UI["vstate"].dims[0] / thumb.shape[1]
+    x = round(x_start / conv_mpp)
+    y = round(y_start / conv_mpp)
+    width = round((x_end - x_start) / conv_mpp)
+    height = round((y_end - y_start) / conv_mpp)
+
+    mask = np.zeros((thumb.shape[0], thumb.shape[1]), dtype=np.uint8)
+    mask[y : y + height, x : x + width] = 1
+
+    Image.fromarray(mask).save(tmp_mask_dir / "mask.png")
+    # ! Mask is currently causing issues. Tool works fine without it,
+    # ! but reduction in segmentation quality for larger WSIs.
+
+    # Run SAM on the point
+    prediction = prompt_segmentor.predict(
+        imgs=[UI["vstate"].slide_path],
+        masks=[tmp_mask_dir / "mask.png"],
+        device=select_device(on_gpu=torch.cuda.is_available()),
+        save_dir=tmp_save_dir / "sam_out",
+        point_coords=point_coords,
+        box_coords=box_coords,
+        mode="wsi",
+        patch_input_shape=(1024, 1024),
+        patch_output_shape=(1024, 1024),
+        resolution=res,
+        units="mpp",
+        multi_prompt=True,
+    )
+
+    ann_loc = f"{prediction[0][1]}.0.db"
+
+    slide_filename = UI["vstate"].slide_path.stem + ".db"
+    destination = doc_config["overlay_folder"] / slide_filename
+
+    # Move the database file
+    # ! Need to check if this is necessary
+    move(ann_loc, destination)
+
+    fname = make_safe_name(destination)
+    resp = UI["s"].put(
+        f"http://{host2}:{port}/tileserver/overlay",
+        data={"overlay_path": fname},
+    )
+    ann_types = json.loads(resp.text)
+    update_ui_on_new_annotations(ann_types)
+
+    # Clean up temp files
+    rmtree(tmp_save_dir)
 
 
 # endregion
@@ -1482,7 +1597,7 @@ def gather_ui_elements(  # noqa: PLR0915
     )
     model_drop = Select(
         title="choose model:",
-        options=["hovernet"],
+        options=["hovernet", "SAM"],
         height=25,
         width=120,
         max_width=120,
@@ -1617,6 +1732,7 @@ def gather_ui_elements(  # noqa: PLR0915
                 model_row,
                 type_select_row,
             ],
+            strict=False,
         ),
     )
     if "ui_elements_1" in doc_config:
@@ -1650,6 +1766,7 @@ def gather_ui_elements(  # noqa: PLR0915
                 edge_size_spinner,
                 res_switch,
             ],
+            strict=False,
         ),
     )
     if "ui_elements_2" in doc_config:
@@ -2086,7 +2203,16 @@ class DocConfig:
 
         # Set initial slide to first one in base folder
         slide_list = []
-        for ext in ["*.svs", "*ndpi", "*.tiff", "*.tif", "*.mrxs", "*.png", "*.jpg"]:
+        for ext in [
+            "*.svs",
+            "*ndpi",
+            "*.tiff",
+            "*.tif",
+            "*.mrxs",
+            "*.png",
+            "*.jpg",
+            "*.dcm",
+        ]:
             slide_list.extend(list(doc_config["slide_folder"].glob(ext)))
             slide_list.extend(
                 list(doc_config["slide_folder"].glob(str(Path("*") / ext))),

@@ -338,8 +338,7 @@ class HoVerNet(ModelABC):
 
         if mode not in ["original", "fast"]:
             msg = (
-                f"Invalid mode {mode} for HoVerNet. "
-                f"Only support `original` or `fast`."
+                f"Invalid mode {mode} for HoVerNet. Only support `original` or `fast`."
             )
             raise ValueError(
                 msg,
@@ -695,7 +694,7 @@ class HoVerNet(ModelABC):
                 inst_type = inst_type_crop[inst_map_crop]
 
                 (type_list, type_pixels) = np.unique(inst_type, return_counts=True)
-                type_list = list(zip(type_list, type_pixels))
+                type_list = list(zip(type_list, type_pixels, strict=False))
                 type_list = sorted(type_list, key=lambda x: x[1], reverse=True)
 
                 inst_type = type_list[0][0]

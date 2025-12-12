@@ -2,133 +2,221 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
+from typing import TYPE_CHECKING
 
 import numpy as np
-from tiatoolbox.models.models_abc import ModelABC
 import torch
-import torch.nn.functional as F  # noqa: N812
-from skimage import morphology
-from torch import nn
+from PIL import Image
+from transformers import SamModel, SamProcessor
 
-from tiatoolbox.utils import misc
+from tiatoolbox.models.models_abc import ModelABC
 
-from sam2.build_sam import build_sam2
-from sam2.sam2_image_predictor import SAM2ImagePredictor
-from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+if TYPE_CHECKING:  # pragma: no cover
+    from tiatoolbox.type_hints import IntBounds, IntPair
 
-class SAMPrompts():
-    """Structure of prompts for SAM."""
-    def __init__(self, point_coords = None, point_labels = None, box_coords = None):
-        self.point_coords = point_coords
-        self.point_labels = point_labels
-        if(point_coords and point_labels is None):
-            self.point_labels = np.arange(1,len(point_coords)+1) # Default labels
-        self.box_coords = box_coords
 
 class SAM(ModelABC):
+    """Segment Anything Model (SAM) Architecture.
+
+    Meta AI's zero-shot segmentation model.
+    SAM is used for interactive general-purpose segmentation.
+
+    Currently supports SAM, which requires a checkpoint and model type.
+
+    SAM accepts an RGB image patch along with a list of point and bounding
+    box coordinates as prompts.
+
+    Args:
+        model_type (str):
+            Model type.
+            Currently supported: vit_b, vit_l, vit_h.
+        checkpoint_path (str):
+            Path to the model checkpoint.
+        device (str):
+            Device to run inference on.
+
+    Examples:
+        >>> # instantiate SAM with checkpoint path and model type
+        >>> sam = SAM(
+        ...     model_type="vit_b",
+        ...     checkpoint_path="path/to/sam_checkpoint.pth"
+        ... )
+    """
+
     def __init__(
         self: SAM,
-        model_hf_path: str = "facebook/sam2-hiera-tiny",
-        checkpoint_path: str = None,
-        model_cfg_path: str = None,
+        model_path: str = "facebook/sam-vit-huge",
+        *,
+        device: str = "cpu",
     ) -> None:
         """Initialize :class:`SAM`."""
         super().__init__()
         self.net_name = "SAM"
+        self.device = device
 
-        if checkpoint_path is None or model_cfg_path is None:
-            self.model = build_sam2_hf(model_hf_path, device="cpu")
-        else:
-            self.model = build_sam2(model_cfg_path, checkpoint_path)
-    
-        self.predictor = SAM2ImagePredictor(self.model)
-        self.generator = SAM2AutomaticMaskGenerator(self.model)
+        self.model = SamModel.from_pretrained(model_path).to(device)
+        self.processor = SamProcessor.from_pretrained(model_path)
 
-    def forward(self: SAM, image: np.ndarray, prompts: SAMPrompts = None) -> np.ndarray:
-        """Torch method, this contains logic for using layers defined in init."""
-        mask = self.generate_mask(self, image, prompts)
-        return mask
-    
+    def forward(  # skipcq: PYL-W0221
+        self: SAM,
+        imgs: list,
+        point_coords: list | None = None,
+        box_coords: list | None = None,
+    ) -> np.ndarray:
+        """Torch method. Defines forward pass on each image in the batch.
+
+        Note: This architecture only uses a single layer, so only one forward pass
+        is needed.
+
+        Args:
+            imgs (list):
+                List of images to process, of the shape NHWC.
+            point_coords (list):
+                List of point coordinates for each image.
+            box_coords (list):
+                Bounding box coordinates for each image.
+
+        Returns:
+            list:
+                List of masks and scores for each image.
+
+        """
+        masks, scores = [], []
+        for i, img in enumerate(imgs):
+            image = [Image.fromarray(img)]
+            embeddings, orig_sizes, reshaped_sizes = self._encode_image(image)
+            point_labels = None
+            points = None
+            boxes = None
+
+            # Processor expects coordinates to be lists
+            def format_coords(coords: np.ndarray | list) -> list:
+                """Helper function that converts coordinates to list format."""
+                if isinstance(coords, np.ndarray):
+                    return coords.tolist()
+                if isinstance(coords[0], np.ndarray):
+                    return [
+                        item.tolist() if isinstance(item, np.ndarray) else item
+                        for item in coords
+                    ]
+                return coords
+
+            if point_coords is not None:
+                points = point_coords[i]
+                # Convert point coordinates to list
+                if points is not None:
+                    point_labels = [[[1] * len(points)]]
+                    points = [format_coords(points)]
+
+            if box_coords is not None:
+                boxes = box_coords[i]
+                # Convert box coordinates to list
+                if boxes is not None:
+                    boxes = [format_coords(boxes)]
+
+            inputs = self.processor(
+                image,
+                input_points=points,
+                input_labels=point_labels,
+                input_boxes=boxes,
+                return_tensors="pt",
+            ).to(self.device)
+
+            # Replaces pixel_values with image embeddings
+            inputs.pop("pixel_values", None)
+            inputs.update(
+                {
+                    "image_embeddings": embeddings,
+                    "original_sizes": orig_sizes,
+                    "reshaped_input_sizes": reshaped_sizes,
+                }
+            )
+
+            with torch.inference_mode():
+                # Forward pass through the model
+                outputs = self.model(**inputs, multimask_output=False)
+                image_masks = self.processor.image_processor.post_process_masks(
+                    outputs.pred_masks.cpu(),
+                    inputs["original_sizes"].cpu(),
+                    inputs["reshaped_input_sizes"].cpu(),
+                )
+                image_scores = outputs.iou_scores.cpu()
+            masks.append(image_masks)
+            scores.append(image_scores)
+            torch.cuda.empty_cache()
+
+        return np.array(masks), np.array(scores)
+
     @staticmethod
     def infer_batch(
         model: torch.nn.Module,
         batch_data: list,
-        prompts: SAMPrompts,
+        point_coords: list[list[IntPair]] | None = None,
+        box_coords: list[IntBounds] | None = None,
         *,
-        device,
+        device: str = "cpu",
     ) -> np.ndarray:
         """Run inference on an input batch.
 
         Contains logic for forward operation as well as I/O aggregation.
+        SAM accepts a list of points and a single bounding box per image.
 
         Args:
             model (nn.Module):
                 PyTorch defined model.
-            batch_data (np.ndarray):
+            batch_data (list):
                 A batch of data generated by
                 `torch.utils.data.DataLoader`.
-            on_gpu (bool):
-                Whether to run inference on a GPU.
+            point_coords (list):
+                Point coordinates for each image in the batch.
+            box_coords (list):
+                Bounding box coordinates for each image in the batch.
+            device (str):
+                Device to run inference on.
+
+        Returns:
+            pred_info (list):
+                Tuple of masks and scores for each image in the batch.
 
         """
-        model.eval()
-        model = model.to(device)
+        model.eval().to(device)
 
-        if isinstance(batch_data, torch.Tensor): # Move the tensor to the CPU if it's a PyTorch tensor
-            batch_data = batch_data.to(device).type(torch.float32)
+        if isinstance(batch_data, torch.Tensor):
             batch_data = batch_data.cpu().numpy()
 
         with torch.inference_mode():
-            batch_data = model.preproc(batch_data)
-            output = model(batch_data, prompts)
-            output = model.postproc(output)
-        return output
+            masks, scores = model(batch_data, point_coords, box_coords)
 
-    @staticmethod
-    def encode_image(self, image: np.ndarray) -> np.ndarray:
-        """Encodes the image for feature extraction."""
-        self.predictor.set_image(image)
-    
-    @staticmethod
-    def generate_mask(self, features: np.ndarray, prompts: SAMPrompts) -> np.ndarray:
-        """Generates a segmentation mask using SAM 2, optionally guided by a prompt."""
-        if prompts:
-            self.encode_image(self, features)
-            masks, scores, _ = self.predictor.predict(
-                point_coords=prompts.point_coords,
-                point_labels=prompts.point_labels,
-                box=prompts.box_coords,
-                multimask_output=False,
-            )
-            sorted_ind = np.argsort(scores)[::-1]
-            masks = masks[sorted_ind]
-        else:
-            masks = self.generator.generate(features)
-        return masks
-    
-    @staticmethod
-    def load_weights(self, checkpoint_path: str) -> None:
-        """Loads model weights from specified checkpoint."""
-        self.model.load_state_dict(torch.load(checkpoint_path, map_location=self.device))
+        return masks, scores
+
+    def _encode_image(self: SAM, image: np.ndarray) -> np.ndarray:
+        """Encodes image and stores size info for later mask post-processing."""
+        processed = self.processor(image, return_tensors="pt")
+        original_sizes = processed["original_sizes"]
+        reshaped_sizes = processed["reshaped_input_sizes"]
+
+        inputs = processed.to(self.device)
+        embeddings = self.model.get_image_embeddings(inputs["pixel_values"])
+        return embeddings, original_sizes, reshaped_sizes
 
     @staticmethod
     def preproc(image: np.ndarray) -> np.ndarray:
-        """Pre-processes images - Converts them into a format accepted by SAM (HWC) from NCHW."""
-        if isinstance(image, torch.Tensor): # Move the tensor to the CPU if it's a PyTorch tensor
-            image = image.cpu().numpy()
-        
-        # Handle different shapes
-        if image.ndim == 4 and image.shape == (1,512,512,3):  # Case 1: (N, H, W, C)
-            image = np.squeeze(image, axis=0)  # Remove batch dimension
-        elif image.ndim == 4 and image.shape == (1,3,512,512):  # Case 2: (N, C, H, W)
-            image = np.squeeze(image, axis=0)  # Remove batch dimension
-            image = np.transpose(image, (1, 2, 0))  # (C, H, W) -> (H, W, C)
+        """Pre-processes an image - Converts it into a format accepted by SAM (HWC)."""
+        # Move the tensor to the CPU if it's a PyTorch tensor
+        if isinstance(image, torch.Tensor):
+            image = image.permute(1, 2, 0).cpu().numpy()
 
-        image = image[:, :, :3]  # Remove alpha channel
-        return image
+        return image[..., :3]  # Remove alpha channel if present
 
-    @staticmethod
-    def postproc(image: np.ndarray) -> np.ndarray:
-        """Define the post-processing of this class of model."""
-        return image
+    def to(
+        self: ModelABC,
+        device: str = "cpu",
+        dtype: torch.dtype | None = None,
+        *,
+        non_blocking: bool = False,
+    ) -> ModelABC | torch.nn.DataParallel[ModelABC]:
+        """Moves the model to the specified device."""
+        super().to(device, dtype=dtype, non_blocking=non_blocking)
+        self.device = device
+        self.model.to(device)
+        return self
